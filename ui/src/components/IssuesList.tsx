@@ -50,6 +50,7 @@ import {
   issueTrailingColumns,
 } from "./IssueColumns";
 import { StatusIcon } from "./StatusIcon";
+import { ForgeStatusBadge } from "./ForgeStatusBadge";
 import { EmptyState } from "./EmptyState";
 import { Identity } from "./Identity";
 import { IssueGroupHeader } from "./IssueGroupHeader";
@@ -1422,8 +1423,10 @@ export function IssuesList({
                         )}
                         mobileMeta={issueActivityText(issue).toLowerCase()}
                         desktopTrailing={(
-                          visibleTrailingIssueColumns.length > 0 ? (
-                            <InboxIssueTrailingColumns
+                          <>
+                            <ForgeStatusBadge issue={issue} size="sm" />
+                            {visibleTrailingIssueColumns.length > 0 ? (
+                              <InboxIssueTrailingColumns
                               issue={issue}
                               columns={visibleTrailingIssueColumns}
                               projectName={issueProject?.name ?? null}
@@ -1542,7 +1545,8 @@ export function IssuesList({
                                 </Popover>
                               )}
                             />
-                          ) : undefined
+                          ) : null}
+                          </>
                         )}
                       />
                       {hasChildren && isExpanded && children.map((child) => renderIssueRow(child, depth + 1))}

@@ -81,6 +81,19 @@ import {
   parseIssueExecutionState,
 } from "../services/issue-execution-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+import {
+  assertForgeIssueCompletionAllowed,
+  ForgeCompletionGuardError,
+  isForgeLinkedIssue,
+  shouldGuardIssueCompletion,
+} from "../services/forge-completion-guard.js";
+import {
+  getLinkedIssueForgeStatus,
+  linkIssueToForge,
+  resolveIssueByChangeId,
+  syncForgeCharterToIssue,
+  ForgeSyncError,
+} from "../services/forge-sync.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -2076,6 +2089,46 @@ export function issueRoutes(
       }
     }
 
+    // Forge completion guard: block linked issues transitioning TO "done" unless Forge verifies
+    if (shouldGuardIssueCompletion(existing.status, updateFields.status) && isForgeLinkedIssue(existing)) {
+      try {
+        await assertForgeIssueCompletionAllowed(
+          {
+            id: existing.id,
+            companyId: existing.companyId,
+            originKind: existing.originKind,
+            originId: existing.originId,
+            status: existing.status,
+          },
+          {
+            logActivity: async (input) => {
+              await logActivity(db, {
+                companyId: input.companyId,
+                actorType: actor.actorType,
+                actorId: actor.actorId,
+                agentId: actor.agentId,
+                runId: actor.runId,
+                action: input.action,
+                entityType: input.entityType,
+                entityId: input.entityId,
+                details: input.details,
+              });
+            },
+          }
+        );
+      } catch (err) {
+        if (err instanceof ForgeCompletionGuardError) {
+          res.status(409).json({
+            error: err.message,
+            code: err.code,
+            changeId: err.changeId,
+          });
+          return;
+        }
+        throw err;
+      }
+    }
+
     let issue;
     try {
       if (transition.decision && decisionId) {
@@ -3836,6 +3889,167 @@ export function issueRoutes(
     });
 
     res.json({ ok: true });
+  });
+
+  // =============================================================================
+  // Forge Sync Routes - Bidirectional sync between Paperclip issues and Forge Charters
+  // =============================================================================
+
+  // POST /api/issues/:id/forge-link - Link an existing issue to a Forge Charter
+  router.post("/issues/:id/forge-link", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+
+    const changeId = req.body?.changeId;
+    if (!changeId || typeof changeId !== "string") {
+      res.status(400).json({ error: "Missing or invalid changeId" });
+      return;
+    }
+
+    try {
+      const result = await linkIssueToForge(db, {
+        issueId: id,
+        changeId,
+        companyId: issue.companyId,
+      });
+
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.forge_linked",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          changeId,
+          previousChangeId: result.previousChangeId,
+        },
+      });
+
+      res.json({
+        issueId: result.issueId,
+        changeId: result.changeId,
+        linked: result.linked,
+      });
+    } catch (err) {
+      if (err instanceof ForgeSyncError) {
+        res.status(err.status).json({
+          error: err.message,
+          code: err.code,
+          changeId: err.changeId,
+        });
+        return;
+      }
+      throw err;
+    }
+  });
+
+  // GET /api/issues/:id/forge-link - Get Forge link status for an issue
+  router.get("/issues/:id/forge-link", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+
+    const result = await getLinkedIssueForgeStatus(db, id, issue.companyId);
+
+    res.json({
+      issueId: result.issueId,
+      changeId: result.changeId,
+      forgeStatus: result.forgeStatus,
+      linkActive: result.linkActive,
+      ...(result.error ? { error: result.error } : {}),
+    });
+  });
+
+  // GET /api/companies/:companyId/forge/charters/:changeId/issue - Resolve linked issue by change_id
+  router.get("/companies/:companyId/forge/charters/:changeId/issue", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+
+    const changeId = req.params.changeId as string;
+    if (!changeId) {
+      res.status(400).json({ error: "Missing changeId" });
+      return;
+    }
+
+    const issue = await resolveIssueByChangeId(db, companyId, changeId);
+
+    if (!issue) {
+      res.status(404).json({ error: "No linked issue found for this Charter" });
+      return;
+    }
+
+    res.json(issue);
+  });
+
+  // POST /api/companies/:companyId/forge/charters/:changeId/sync-issue - Create or return linked issue
+  router.post("/companies/:companyId/forge/charters/:changeId/sync-issue", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+
+    const changeId = req.params.changeId as string;
+    if (!changeId) {
+      res.status(400).json({ error: "Missing changeId" });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+
+    try {
+      const result = await syncForgeCharterToIssue(db, {
+        companyId,
+        changeId,
+        title: req.body?.title,
+        description: req.body?.description,
+        createdByAgentId: actor.agentId,
+        createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+      });
+
+      if (result.created) {
+        await logActivity(db, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "issue.forge_sync_created",
+          entityType: "issue",
+          entityId: result.issue.id,
+          details: {
+            changeId,
+            title: result.issue.title,
+          },
+        });
+      }
+
+      res.status(result.created ? 201 : 200).json({
+        issue: result.issue,
+        created: result.created,
+        changeId: result.changeId,
+      });
+    } catch (err) {
+      if (err instanceof ForgeSyncError) {
+        res.status(err.status).json({
+          error: err.message,
+          code: err.code,
+          changeId: err.changeId,
+        });
+        return;
+      }
+      throw err;
+    }
   });
 
   return router;

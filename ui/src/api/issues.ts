@@ -19,6 +19,14 @@ import type {
   ReleaseIssueTreeHold,
   UpsertIssueDocument,
 } from "@paperclipai/shared";
+
+export interface ForgeLinkStatus {
+  issueId: string;
+  changeId: string;
+  forgeStatus: string | null;
+  linkActive: boolean;
+  error?: string;
+}
 import { api } from "./client";
 
 export type IssueUpdateResponse = Issue & {
@@ -235,4 +243,5 @@ export const issuesApi = {
   updateWorkProduct: (id: string, data: Record<string, unknown>) =>
     api.patch<IssueWorkProduct>(`/work-products/${id}`, data),
   deleteWorkProduct: (id: string) => api.delete<IssueWorkProduct>(`/work-products/${id}`),
+  getForgeLink: (id: string) => api.get<ForgeLinkStatus>(`/issues/${id}/forge-link`),
 };

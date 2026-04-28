@@ -77,6 +77,7 @@ import { ImageGalleryModal } from "../components/ImageGalleryModal";
 import { ScrollToBottom } from "../components/ScrollToBottom";
 import { StatusIcon } from "../components/StatusIcon";
 import { PriorityIcon } from "../components/PriorityIcon";
+import { ForgeStatusBadge } from "../components/ForgeStatusBadge";
 import { Identity } from "../components/Identity";
 import { PluginSlotMount, PluginSlotOutlet, usePluginSlots } from "@/plugins/slots";
 import { PluginLauncherOutlet } from "@/plugins/launchers";
@@ -2905,6 +2906,8 @@ export function IssueDetail() {
               Routine
             </Link>
           )}
+
+          <ForgeStatusBadge issue={issue} size="sm" />
 
           {issue.projectId ? (
             <Link

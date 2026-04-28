@@ -27,6 +27,7 @@ const mockIssuesApi = vi.hoisted(() => ({
   uploadAttachment: vi.fn(),
   deleteAttachment: vi.fn(),
   upsertDocument: vi.fn(),
+  getForgeLink: vi.fn(),
 }));
 
 const mockActivityApi = vi.hoisted(() => ({
@@ -1205,5 +1206,162 @@ describe("IssueDetail", () => {
         && element.textContent?.includes("Close"),
       );
     expect(footer?.className).toContain("bg-background");
+  });
+
+  describe("Forge status badge", () => {
+    it("renders Forge badge in header for linked issues", async () => {
+      const linkedIssue: Issue = {
+        ...createIssue(),
+        id: "linked-issue-1",
+        identifier: "LINKED-1",
+        originKind: "forge_charter",
+        originId: "change-detail123",
+      };
+
+      mockIssuesApi.get.mockResolvedValue(linkedIssue);
+      mockIssuesApi.listComments.mockResolvedValue([]);
+      mockIssuesApi.listAttachments.mockResolvedValue([]);
+      mockIssuesApi.listFeedbackVotes.mockResolvedValue([]);
+      mockIssuesApi.getForgeLink.mockResolvedValue({
+        issueId: linkedIssue.id,
+        changeId: "change-detail123",
+        forgeStatus: "in_progress",
+        linkActive: true,
+      });
+      mockActivityApi.forIssue.mockResolvedValue([]);
+      mockActivityApi.runsForIssue.mockResolvedValue([]);
+      mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([]);
+      mockHeartbeatsApi.activeRunForIssue.mockResolvedValue(null);
+      mockAgentsApi.list.mockResolvedValue([]);
+      mockAccessApi.getCurrentBoardAccess.mockResolvedValue({ companyIds: ["company-1"] });
+      mockAccessApi.listUserDirectory.mockResolvedValue({ users: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-1" } });
+      mockProjectsApi.list.mockResolvedValue([]);
+      mockInstanceSettingsApi.getGeneral.mockResolvedValue({});
+
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+
+      act(() => {
+        root.render(
+          <QueryClientProvider client={queryClient}>
+            <IssueDetail />
+          </QueryClientProvider>,
+        );
+      });
+
+      await flushReact();
+      await flushReact();
+
+      // Should render the change_id in the badge
+      expect(container.textContent).toContain("change-d");
+      expect(mockIssuesApi.getForgeLink).toHaveBeenCalledWith(linkedIssue.id);
+
+      act(() => {
+        root.unmount();
+      });
+    });
+
+    it("does not render Forge badge for unlinked issues", async () => {
+      const unlinkedIssue = createIssue();
+
+      mockIssuesApi.get.mockResolvedValue(unlinkedIssue);
+      mockIssuesApi.listComments.mockResolvedValue([]);
+      mockIssuesApi.listAttachments.mockResolvedValue([]);
+      mockIssuesApi.listFeedbackVotes.mockResolvedValue([]);
+      mockActivityApi.forIssue.mockResolvedValue([]);
+      mockActivityApi.runsForIssue.mockResolvedValue([]);
+      mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([]);
+      mockHeartbeatsApi.activeRunForIssue.mockResolvedValue(null);
+      mockAgentsApi.list.mockResolvedValue([]);
+      mockAccessApi.getCurrentBoardAccess.mockResolvedValue({ companyIds: ["company-1"] });
+      mockAccessApi.listUserDirectory.mockResolvedValue({ users: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-1" } });
+      mockProjectsApi.list.mockResolvedValue([]);
+      mockInstanceSettingsApi.getGeneral.mockResolvedValue({});
+
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+
+      act(() => {
+        root.render(
+          <QueryClientProvider client={queryClient}>
+            <IssueDetail />
+          </QueryClientProvider>,
+        );
+      });
+
+      await flushReact();
+      await flushReact();
+
+      // Wait to ensure no async calls happen
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+
+      // Should not call getForgeLink for unlinked issues
+      expect(mockIssuesApi.getForgeLink).not.toHaveBeenCalled();
+
+      act(() => {
+        root.unmount();
+      });
+    });
+
+    it("shows error state when Forge link API returns failure in detail view", async () => {
+      const linkedIssue: Issue = {
+        ...createIssue(),
+        id: "linked-issue-error",
+        identifier: "ERROR-1",
+        originKind: "forge_charter",
+        originId: "change-error456",
+      };
+
+      mockIssuesApi.get.mockResolvedValue(linkedIssue);
+      mockIssuesApi.listComments.mockResolvedValue([]);
+      mockIssuesApi.listAttachments.mockResolvedValue([]);
+      mockIssuesApi.listFeedbackVotes.mockResolvedValue([]);
+      mockIssuesApi.getForgeLink.mockResolvedValue({
+        issueId: linkedIssue.id,
+        changeId: "change-error456",
+        forgeStatus: null,
+        linkActive: true,
+        error: "Failed to fetch Forge status",
+      });
+      mockActivityApi.forIssue.mockResolvedValue([]);
+      mockActivityApi.runsForIssue.mockResolvedValue([]);
+      mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([]);
+      mockHeartbeatsApi.activeRunForIssue.mockResolvedValue(null);
+      mockAgentsApi.list.mockResolvedValue([]);
+      mockAccessApi.getCurrentBoardAccess.mockResolvedValue({ companyIds: ["company-1"] });
+      mockAccessApi.listUserDirectory.mockResolvedValue({ users: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-1" } });
+      mockProjectsApi.list.mockResolvedValue([]);
+      mockInstanceSettingsApi.getGeneral.mockResolvedValue({});
+
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+
+      act(() => {
+        root.render(
+          <QueryClientProvider client={queryClient}>
+            <IssueDetail />
+          </QueryClientProvider>,
+        );
+      });
+
+      await flushReact();
+      await flushReact();
+
+      // Should show error badge
+      const errorElement = container.querySelector("[title='Failed to fetch Forge status']");
+      expect(errorElement).not.toBeNull();
+
+      act(() => {
+        root.unmount();
+      });
+    });
   });
 });

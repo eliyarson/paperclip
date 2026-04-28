@@ -50,3 +50,32 @@ export { notifyHireApproved, type NotifyHireApprovedInput } from "./hire-hook.js
 export { publishLiveEvent, subscribeCompanyLiveEvents } from "./live-events.js";
 export { reconcilePersistedRuntimeServicesOnStartup, restartDesiredRuntimeServicesOnStartup } from "./workspace-runtime.js";
 export { createStorageServiceFromConfig, getStorageService } from "../storage/index.js";
+export {
+  assertForgeIssueCompletionAllowed,
+  fetchForgeChangeStatus,
+  FORGE_LINKED_ORIGIN_KIND,
+  isForgeLinkedIssue,
+  isForgeStatusCompletionAllowed,
+  shouldGuardIssueCompletion,
+  type ForgeCompletionGuardConfig,
+  type ForgeCompletionGuardResult,
+  type ForgeLinkedIssue,
+  ForgeCompletionGuardError,
+} from "./forge-completion-guard.js";
+
+export {
+  fetchForgeStatus,
+  findLinkedIssueByChangeId,
+  linkIssueToForge,
+  getLinkedIssueForgeStatus,
+  resolveIssueByChangeId,
+  syncForgeCharterToIssue,
+  unlinkIssueFromForge,
+  type ForgeLinkInput,
+  type ForgeLinkResult,
+  type ForgeStatusResult,
+  type ForgeLinkedIssueSummary,
+  type ForgeSyncIssueInput,
+  type ForgeSyncIssueResult,
+  ForgeSyncError,
+} from "./forge-sync.js";

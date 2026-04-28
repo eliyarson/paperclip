@@ -20,6 +20,7 @@ const dialogState = vi.hoisted(() => ({
 const mockIssuesApi = vi.hoisted(() => ({
   list: vi.fn(),
   listLabels: vi.fn(),
+  getForgeLink: vi.fn(),
 }));
 
 const mockKanbanBoard = vi.hoisted(() => vi.fn());
@@ -1270,6 +1271,167 @@ describe("IssuesList", () => {
 
     act(() => {
       root.unmount();
+    });
+  });
+
+  describe("Forge status badge", () => {
+    it("renders Forge badge for linked issue rows", async () => {
+      const linkedIssue: Issue = {
+        ...createIssue(),
+        id: "linked-issue-1",
+        originKind: "forge_charter",
+        originId: "change-abc123",
+      };
+
+      mockIssuesApi.getForgeLink.mockResolvedValue({
+        issueId: linkedIssue.id,
+        changeId: "change-abc123",
+        forgeStatus: "verified",
+        linkActive: true,
+      });
+
+      const testContainer = document.createElement("div");
+      document.body.appendChild(testContainer);
+
+      const { root } = renderWithQueryClient(
+        <IssuesList
+          issues={[linkedIssue]}
+          agents={[]}
+          projects={[]}
+          viewStateKey="paperclip:test-forge-badge"
+          onUpdateIssue={() => undefined}
+        />,
+        testContainer,
+      );
+
+      await waitForAssertion(() => {
+        // Badge should be rendered with the change_id
+        expect(testContainer.textContent).toContain("change-a");
+        expect(mockIssuesApi.getForgeLink).toHaveBeenCalledWith(linkedIssue.id);
+      });
+
+      act(() => {
+        root.unmount();
+      });
+      document.body.removeChild(testContainer);
+    });
+
+    it("does not render badge or call API for unlinked issues", async () => {
+      const unlinkedIssue = createIssue();
+
+      // Clear any previous calls from other tests
+      mockIssuesApi.getForgeLink.mockClear();
+
+      const testContainer = document.createElement("div");
+      document.body.appendChild(testContainer);
+
+      const { root } = renderWithQueryClient(
+        <IssuesList
+          issues={[unlinkedIssue]}
+          agents={[]}
+          projects={[]}
+          viewStateKey="paperclip:test-no-forge-badge"
+          onUpdateIssue={() => undefined}
+        />,
+        testContainer,
+      );
+
+      // Wait a bit to ensure no async calls happen
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+
+      // Should not call getForgeLink for unlinked issues
+      expect(mockIssuesApi.getForgeLink).not.toHaveBeenCalled();
+
+      act(() => {
+        root.unmount();
+      });
+      document.body.removeChild(testContainer);
+    });
+
+    it("shows error state when Forge link API returns failure", async () => {
+      const linkedIssue: Issue = {
+        ...createIssue(),
+        id: "linked-issue-error",
+        originKind: "forge_charter",
+        originId: "change-error123",
+      };
+
+      mockIssuesApi.getForgeLink.mockResolvedValue({
+        issueId: linkedIssue.id,
+        changeId: "change-error123",
+        forgeStatus: null,
+        linkActive: true,
+        error: "Forge status unavailable",
+      });
+
+      const testContainer = document.createElement("div");
+      document.body.appendChild(testContainer);
+
+      const { root } = renderWithQueryClient(
+        <IssuesList
+          issues={[linkedIssue]}
+          agents={[]}
+          projects={[]}
+          viewStateKey="paperclip:test-forge-error"
+          onUpdateIssue={() => undefined}
+        />,
+        testContainer,
+      );
+
+      await waitForAssertion(() => {
+        // Should show error badge with title
+        const errorElement = testContainer.querySelector("[title='Forge status unavailable']");
+        expect(errorElement).not.toBeNull();
+      });
+
+      act(() => {
+        root.unmount();
+      });
+      document.body.removeChild(testContainer);
+    });
+
+    it("shows degraded state when link is not active", async () => {
+      const linkedIssue: Issue = {
+        ...createIssue(),
+        id: "linked-issue-inactive",
+        originKind: "forge_charter",
+        originId: "change-inactive123",
+      };
+
+      mockIssuesApi.getForgeLink.mockResolvedValue({
+        issueId: linkedIssue.id,
+        changeId: "change-inactive123",
+        forgeStatus: null,
+        linkActive: false,
+        error: "Issue is not linked to a Forge Charter",
+      });
+
+      const testContainer = document.createElement("div");
+      document.body.appendChild(testContainer);
+
+      const { root } = renderWithQueryClient(
+        <IssuesList
+          issues={[linkedIssue]}
+          agents={[]}
+          projects={[]}
+          viewStateKey="paperclip:test-forge-inactive"
+          onUpdateIssue={() => undefined}
+        />,
+        testContainer,
+      );
+
+      await waitForAssertion(() => {
+        // Should show degraded badge
+        const degradedElement = testContainer.querySelector("[title='Issue is not linked to a Forge Charter']");
+        expect(degradedElement).not.toBeNull();
+      });
+
+      act(() => {
+        root.unmount();
+      });
+      document.body.removeChild(testContainer);
     });
   });
 });
