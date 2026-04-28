@@ -56,6 +56,7 @@ export const issuesApi = {
       includeBlockedBy?: boolean;
       q?: string;
       limit?: number;
+      offset?: number;
     },
   ) => {
     const params = new URLSearchParams();
@@ -78,6 +79,7 @@ export const issuesApi = {
     if (filters?.includeBlockedBy) params.set("includeBlockedBy", "true");
     if (filters?.q) params.set("q", filters.q);
     if (filters?.limit) params.set("limit", String(filters.limit));
+    if (filters?.offset !== undefined) params.set("offset", String(filters.offset));
     const qs = params.toString();
     return api.get<Issue[]>(`/companies/${companyId}/issues${qs ? `?${qs}` : ""}`);
   },

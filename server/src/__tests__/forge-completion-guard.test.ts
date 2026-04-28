@@ -614,6 +614,10 @@ const routeMockAgentService = vi.hoisted(() => ({
   list: vi.fn(async () => []),
 }));
 
+const routeMockCompanyService = vi.hoisted(() => ({
+  getById: vi.fn(async () => ({ id: "company-1", name: "Test Company" })),
+}));
+
 const routeMockProjectService = vi.hoisted(() => ({
   getById: vi.fn(async () => null),
   listByIds: vi.fn(async () => []),
@@ -727,6 +731,7 @@ vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestI
 vi.mock("../services/index.js", () => ({
   accessService: () => routeMockAccessService,
   agentService: () => routeMockAgentService,
+  companyService: () => routeMockCompanyService,
   documentService: () => routeMockDocumentService,
   executionWorkspaceService: () => routeMockExecutionWorkspaceService,
   feedbackService: () => routeMockFeedbackService,
@@ -786,6 +791,7 @@ function registerRouteMocks() {
   vi.doMock("../services/index.js", () => ({
     accessService: () => routeMockAccessService,
     agentService: () => routeMockAgentService,
+    companyService: () => routeMockCompanyService,
     documentService: () => routeMockDocumentService,
     executionWorkspaceService: () => routeMockExecutionWorkspaceService,
     feedbackService: () => routeMockFeedbackService,
