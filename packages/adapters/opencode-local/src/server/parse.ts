@@ -1,5 +1,8 @@
 import { asNumber, asString, parseJson, parseObject } from "@paperclipai/adapter-utils/server-utils";
 
+const OPENCODE_TRANSIENT_UPSTREAM_RE =
+  /(?:high\s+demand|temporary\s+errors?|temporar(?:y|ily)\s+unavailable|rate[-\s]?limit(?:ed)?|too\s+many\s+requests|\b429\b|server\s+overloaded|\boverloaded\b|service\s+unavailable|\b50[234]\b|upstream|try\s+again\s+later|capacity)/i;
+
 function errorText(value: unknown): string {
   if (typeof value === "string") return value;
   const rec = parseObject(value);
@@ -98,4 +101,52 @@ export function isOpenCodeUnknownSessionError(stdout: string, stderr: string): b
   return /unknown\s+session|session\b.*\bnot\s+found|resource\s+not\s+found:.*[\\/]session[\\/].*\.json|notfounderror|no session/i.test(
     haystack,
   );
+}
+
+function buildOpenCodeErrorHaystack(input: {
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): string {
+  return [input.errorMessage ?? "", input.stdout ?? "", input.stderr ?? ""]
+    .join("\n")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function durationMsFromText(amountText: string, unitText: string | null | undefined): number | null {
+  const amount = Number.parseFloat(amountText);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  const unit = (unitText ?? "seconds").toLowerCase();
+  if (/^m(?:s|illi(?:second)?s?)?$/.test(unit)) return amount;
+  if (/^(?:s|sec|secs|second|seconds)$/.test(unit)) return amount * 1000;
+  if (/^(?:m|min|mins|minute|minutes)$/.test(unit)) return amount * 60 * 1000;
+  if (/^(?:h|hr|hrs|hour|hours)$/.test(unit)) return amount * 60 * 60 * 1000;
+  return null;
+}
+
+export function extractOpenCodeRetryNotBefore(input: {
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}, now = new Date()): Date | null {
+  const haystack = buildOpenCodeErrorHaystack(input);
+  const retryAfterMatch = haystack.match(/retry[-\s]?after\s*[:=]?\s*(\d+(?:\.\d+)?)\s*([a-z]+)?/i);
+  const tryAgainInMatch = haystack.match(/try\s+again\s+in\s+(\d+(?:\.\d+)?)\s*([a-z]+)?/i);
+  const match = retryAfterMatch ?? tryAgainInMatch;
+  if (!match) return null;
+  const delayMs = durationMsFromText(match[1] ?? "", match[2]);
+  if (!delayMs) return null;
+  return new Date(now.getTime() + delayMs);
+}
+
+export function isOpenCodeTransientUpstreamError(input: {
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  const haystack = buildOpenCodeErrorHaystack(input);
+  return OPENCODE_TRANSIENT_UPSTREAM_RE.test(haystack);
 }

@@ -34,8 +34,6 @@ import crypto from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { pluginRegistryService } from "../services/plugin-registry.js";
 import { logger } from "../middleware/logger.js";
-import { assertCompanyAccess } from "./authz.js";
-import { badRequest } from "../errors.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -119,11 +117,21 @@ export function resolvePluginUiDir(
     const resolvedPackagePath = path.resolve(packagePath);
     if (fs.existsSync(resolvedPackagePath)) {
       const uiDirFromPackagePath = path.resolve(resolvedPackagePath, entrypointsUi);
-      if (
-        uiDirFromPackagePath.startsWith(resolvedPackagePath)
-        && fs.existsSync(uiDirFromPackagePath)
-      ) {
-        return uiDirFromPackagePath;
+      // Security: use realpath comparison instead of startsWith prefix check
+      // to prevent sibling-path traversal (e.g. /foo/bar matching /foo/bar-baz).
+      try {
+        const realUiDir = fs.realpathSync(uiDirFromPackagePath);
+        const realPackagePath = fs.realpathSync(resolvedPackagePath);
+        const relative = path.relative(realPackagePath, realUiDir);
+        if (
+          !relative.startsWith("..")
+          && !path.isAbsolute(relative)
+          && fs.existsSync(uiDirFromPackagePath)
+        ) {
+          return uiDirFromPackagePath;
+        }
+      } catch {
+        // realpath failed — fall through to node_modules resolution
       }
     }
   }
@@ -279,23 +287,11 @@ export function pluginUiStaticRoutes(db: Db, options: PluginUiStaticRouteOptions
       return;
     }
 
-    const rawCompanyId = req.query.companyId;
-    if (
-      Array.isArray(rawCompanyId) ||
-      (rawCompanyId !== undefined && typeof rawCompanyId !== "string")
-    ) {
-      throw badRequest('"companyId" must be a string when provided');
-    }
-    const companyId = typeof rawCompanyId === "string" ? rawCompanyId.trim() : "";
-    if (companyId) {
-      assertCompanyAccess(req, companyId);
-    }
-
-    // Step 2b: Check for devUiUrl in company-scoped plugin config — proxy to
-    // local dev server when a plugin author has configured hot-reload.
+    // Step 2b: Check for devUiUrl in plugin config — proxy to local dev server
+    // when a plugin author has configured a dev server URL for hot-reload.
     // See PLUGIN_SPEC.md §27.2 — Local Development Workflow
     try {
-      const configRow = companyId ? await registry.getConfig(plugin.id, companyId) : null;
+      const configRow = await registry.getConfig(plugin.id);
       const devUiUrl =
         configRow &&
         typeof configRow === "object" &&

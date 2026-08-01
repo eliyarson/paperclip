@@ -5,58 +5,104 @@ import { fileURLToPath } from "node:url";
 import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
+  adapterExecutionTargetPaperclipApiUrl,
   adapterExecutionTargetRemoteCwd,
-  overrideAdapterExecutionTargetRemoteCwd,
   adapterExecutionTargetSessionIdentity,
   adapterExecutionTargetSessionMatches,
   adapterExecutionTargetUsesManagedHome,
-  adapterExecutionTargetUsesPaperclipBridge,
   describeAdapterExecutionTarget,
   ensureAdapterExecutionTargetCommandResolvable,
-  ensureAdapterExecutionTargetRuntimeCommandInstalled,
   prepareAdapterExecutionTargetRuntime,
   readAdapterExecutionTarget,
   readAdapterExecutionTargetHomeDir,
-  resolveAdapterExecutionTargetTimeoutSec,
   resolveAdapterExecutionTargetCommandForLogs,
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
-  startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
   asNumber,
   asStringArray,
   parseObject,
+  applyPaperclipWorkspaceEnv,
   buildPaperclipEnv,
   joinPromptSections,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   ensurePaperclipSkillSymlink,
   ensurePathInEnv,
-  refreshPaperclipWorkspaceEnvForExecution,
   renderTemplate,
   renderPaperclipWakePrompt,
-  isPaperclipRecoveryWakePayload,
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   runChildProcess,
   readPaperclipRuntimeSkillEntries,
-  readPaperclipIssueWorkModeFromContext,
   resolvePaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
-import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
 import {
-  ensureOpenCodeModelConfiguredAndAvailable,
-  isTruthyEnvFlag,
-  parseOpenCodeModelsOutput,
-  requireOpenCodeModelId,
-} from "./models.js";
+  extractOpenCodeRetryNotBefore,
+  isOpenCodeTransientUpstreamError,
+  isOpenCodeUnknownSessionError,
+  parseOpenCodeJsonl,
+} from "./parse.js";
+import { ensureOpenCodeModelConfiguredAndAvailable } from "./models.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
-import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Cerebro memory capability detection result.
+ */
+interface CerebroPreflightResult {
+  mcpAvailable: boolean;
+  proxyAvailable: boolean;
+  degradedReason?: string;
+}
+
+/**
+ * Detect Cerebro memory capabilities for this run.
+ * Checks for MCP tools and Paperclip proxy fallback.
+ */
+async function detectCerebroCapabilities(input: {
+  env: Record<string, string>;
+  paperclipApiUrl: string | null;
+}): Promise<CerebroPreflightResult> {
+  const result: CerebroPreflightResult = {
+    mcpAvailable: false,
+    proxyAvailable: false,
+  };
+
+  // Check for Cerebro MCP in OpenCode config
+  // OpenCode stores MCP config in ~/.config/opencode/opencode.json
+  // We can't directly read it, but we can infer from env hints
+  const hasCerebroMcpHint = input.env.PAPERCLIP_CEREBRO_MCP_HINT === "true";
+  if (hasCerebroMcpHint) {
+    result.mcpAvailable = true;
+  }
+
+  // Check for Paperclip proxy fallback
+  if (input.paperclipApiUrl) {
+    try {
+      // The proxy endpoints are available if the API URL is configured
+      // Actual availability is determined at call time
+      result.proxyAvailable = true;
+    } catch {
+      // Proxy not available
+    }
+  }
+
+  // Determine degraded reason if neither is available
+  if (!result.mcpAvailable && !result.proxyAvailable) {
+    if (!input.paperclipApiUrl) {
+      result.degradedReason = "Paperclip API URL not configured";
+    } else {
+      result.degradedReason = "Cerebro MCP not detected and proxy unavailable";
+    }
+  }
+
+  return result;
+}
 
 function firstNonEmptyLine(text: string): string {
   return (
@@ -78,78 +124,36 @@ function resolveOpenCodeBiller(env: Record<string, string>, provider: string | n
   return inferOpenAiCompatibleBiller(env, null) ?? provider ?? "unknown";
 }
 
-const REMOTE_OPENCODE_MODELS_PROBE_DEFAULT_TIMEOUT_SEC = 20;
-const REMOTE_OPENCODE_MODELS_PROBE_SANDBOX_TIMEOUT_SEC = 120;
-
-export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
+function buildOpenCodeAttachRuntimeNote(input: {
+  serverUrl: string;
+  paperclipApiUrl: string | undefined;
   runId: string;
-  executionTarget: NonNullable<AdapterExecutionContext["executionTarget"]>;
-  command: string;
-  model: string;
-  cwd: string;
-  env: Record<string, string>;
-  timeoutSec: number;
-  graceSec: number;
-}) {
-  const model = requireOpenCodeModelId(input.model);
+}): string {
+  if (!input.serverUrl) return "";
+  const apiUrl = input.paperclipApiUrl?.trim();
+  return [
+    "Attached OpenCode runtime note:",
+    "- This run is attached to an already-running OpenCode server. Shell tools receive PAPERCLIP_* environment variables via the Paperclip shell-env plugin.",
+    apiUrl
+      ? `- Paperclip API URL: ${apiUrl}`
+      : "- Paperclip API URL is not configured. Report the missing server-side Paperclip env.",
+    `- Paperclip Run ID: ${input.runId}`,
+    "- Use Authorization: Bearer $PAPERCLIP_API_KEY to authenticate Paperclip API calls. Never print the key.",
+  ].join("\n");
+}
 
-  // When the caller opts into OPENCODE_ALLOW_ALL_MODELS, OpenCode accepts any
-  // provider/model at run time (e.g. gateway-routed models that never appear in
-  // `opencode models` output). Honour that on the REMOTE path too by skipping the
-  // remote availability probe; we still enforce the provider/model format above.
-  // Mirrors the local ensureOpenCodeModelConfiguredAndAvailable bypass. Prefer the
-  // explicit run env, then the process env.
-  if (isTruthyEnvFlag(input.env.OPENCODE_ALLOW_ALL_MODELS ?? process.env.OPENCODE_ALLOW_ALL_MODELS)) {
-    return;
-  }
-
-  const defaultProbeTimeoutSec =
-    input.executionTarget.kind === "remote" && input.executionTarget.transport === "sandbox"
-      ? REMOTE_OPENCODE_MODELS_PROBE_SANDBOX_TIMEOUT_SEC
-      : REMOTE_OPENCODE_MODELS_PROBE_DEFAULT_TIMEOUT_SEC;
-  const probeTimeoutSec = input.timeoutSec > 0
-    ? Math.min(input.timeoutSec, defaultProbeTimeoutSec)
-    : defaultProbeTimeoutSec;
-  const probe = await runAdapterExecutionTargetProcess(
-    input.runId,
-    input.executionTarget,
-    input.command,
-    ["models"],
-    {
-      cwd: input.cwd,
-      env: input.env,
-      timeoutSec: probeTimeoutSec,
-      graceSec: input.graceSec,
-      onLog: async () => {},
-    },
-  );
-
-  if (probe.timedOut) {
-    throw new Error(`\`opencode models\` timed out on the remote execution target after ${probeTimeoutSec}s.`);
-  }
-
-  if ((probe.exitCode ?? 1) !== 0) {
-    const detail = firstNonEmptyLine(probe.stderr) || firstNonEmptyLine(probe.stdout);
-    throw new Error(
-      detail
-        ? `\`opencode models\` failed on the remote execution target: ${detail}`
-        : "`opencode models` failed on the remote execution target.",
-    );
-  }
-
-  const models = parseOpenCodeModelsOutput(probe.stdout);
-  if (models.length === 0) {
-    throw new Error(
-      "OpenCode returned no models on the remote execution target. Run `opencode models` there and verify provider auth.",
-    );
-  }
-
-  if (!models.some((entry) => entry.id === model)) {
-    const sample = models.slice(0, 12).map((entry) => entry.id).join(", ");
-    throw new Error(
-      `Configured OpenCode model is unavailable on the remote execution target: ${model}. Available models: ${sample}${models.length > 12 ? ", ..." : ""}`,
-    );
-  }
+function resolveLocalPaperclipRuntimeApiUrl(): string | null {
+  const rawPort = process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "";
+  const port = rawPort.trim();
+  if (!port) return null;
+  const rawHost = (process.env.PAPERCLIP_LISTEN_HOST ?? process.env.HOST ?? "localhost").trim();
+  const host =
+    !rawHost || rawHost === "0.0.0.0" || rawHost === "::"
+      ? "localhost"
+      : rawHost.includes(":") && !rawHost.startsWith("[") && !rawHost.endsWith("]")
+        ? `[${rawHost}]`
+        : rawHost;
+  return `http://${host}:${port}`;
 }
 
 function claudeSkillsHome(): string {
@@ -222,6 +226,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const command = asString(config.command, "opencode");
   const model = asString(config.model, "").trim();
   const variant = asString(config.variant, "").trim();
+  const serverUrl = asString(config.serverUrl, "").trim();
 
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
@@ -239,7 +244,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const useConfiguredInsteadOfAgentHome = workspaceSource === "agent_home" && configuredCwd.length > 0;
   const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
   const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
-  let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
   const openCodeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredOpenCodeSkillNames = resolvePaperclipDesiredSkillNames(config, openCodeSkillEntries);
@@ -252,6 +256,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   const envConfig = parseObject(config.env);
+  const hasExplicitApiKey =
+    typeof envConfig.PAPERCLIP_API_KEY === "string" && envConfig.PAPERCLIP_API_KEY.trim().length > 0;
+  const hasExplicitApiUrl =
+    typeof envConfig.PAPERCLIP_API_URL === "string" && envConfig.PAPERCLIP_API_URL.trim().length > 0;
   const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
   env.PAPERCLIP_RUN_ID = runId;
   const wakeTaskId =
@@ -278,37 +286,64 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
   const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
-  const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
-  if (issueWorkMode) env.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
   if (wakeReason) env.PAPERCLIP_WAKE_REASON = wakeReason;
   if (wakeCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = wakeCommentId;
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
   if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
-  refreshPaperclipWorkspaceEnvForExecution({
-    env,
-    envConfig,
+  applyPaperclipWorkspaceEnv(env, {
     workspaceCwd: effectiveWorkspaceCwd,
     workspaceSource,
     workspaceId,
     workspaceRepoUrl,
     workspaceRepoRef,
-    workspaceHints,
     agentHome,
-    executionTargetIsRemote,
-    executionCwd: effectiveExecutionCwd,
   });
+  if (workspaceHints.length > 0) env.PAPERCLIP_WORKSPACES_JSON = JSON.stringify(workspaceHints);
+  const targetPaperclipApiUrl = adapterExecutionTargetPaperclipApiUrl(executionTarget);
+  if (targetPaperclipApiUrl) env.PAPERCLIP_API_URL = targetPaperclipApiUrl;
+  const localAttachPaperclipApiUrl =
+    serverUrl && !executionTargetIsRemote && !hasExplicitApiUrl
+      ? resolveLocalPaperclipRuntimeApiUrl()
+      : null;
+  if (localAttachPaperclipApiUrl) env.PAPERCLIP_API_URL = localAttachPaperclipApiUrl;
+
+  for (const [key, value] of Object.entries(envConfig)) {
+    if (typeof value === "string") env[key] = value;
+  }
   // Prevent OpenCode from writing an opencode.json config file into the
   // project working directory (which would pollute the git repo).  Model
   // selection is already handled via the --model CLI flag.  Set after the
   // envConfig loop so user overrides cannot disable this guard.
   env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
-  if (authToken) {
+  if (!hasExplicitApiKey && authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
+  let attachEnvDir: string | null = null;
+  let attachEnvPath: string | null = null;
+  const paperclipEnvForAttach: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value === "string" && value.length > 0 && key.startsWith("PAPERCLIP_")) {
+      paperclipEnvForAttach[key] = value;
+    }
+  }
+  if (Object.keys(paperclipEnvForAttach).length > 0) {
+    attachEnvDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-attach-env-"));
+    attachEnvPath = path.join(attachEnvDir, "env.json");
+    await fs.writeFile(attachEnvPath, JSON.stringify(paperclipEnvForAttach), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+  }
+
+  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({
+    env,
+    config,
+    pluginModuleDir: __moduleDir,
+    pluginAttachEnvPath: attachEnvPath ?? undefined,
+  });
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   try {
@@ -317,33 +352,35 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
-    const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
-      executionTarget,
-      asNumber(config.timeoutSec, 0),
-    );
-    const graceSec = asNumber(config.graceSec, 20);
-    await ensureAdapterExecutionTargetRuntimeCommandInstalled({
-      runId,
-      target: executionTarget,
-      installCommand: ctx.runtimeCommandSpec?.installCommand,
-    detectCommand: ctx.runtimeCommandSpec?.detectCommand,
-      cwd,
+
+    // Cerebro memory preflight: detect MCP availability and proxy fallback
+    // Use the effective PAPERCLIP_API_URL from env after attach/local fallbacks
+    const effectivePaperclipApiUrl = env.PAPERCLIP_API_URL ?? null;
+    const cerebroPreflight = await detectCerebroCapabilities({
       env: runtimeEnv,
-      timeoutSec,
-      graceSec,
-      onLog,
+      paperclipApiUrl: effectivePaperclipApiUrl,
     });
-    await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv, {
-      installCommand: SANDBOX_INSTALL_COMMAND,
-      timeoutSec,
-    });
+    if (cerebroPreflight.mcpAvailable || cerebroPreflight.proxyAvailable) {
+      await onLog(
+        "stderr",
+        `[paperclip] Cerebro memory: ${cerebroPreflight.mcpAvailable ? "MCP available" : ""}${cerebroPreflight.mcpAvailable && cerebroPreflight.proxyAvailable ? " + " : ""}${cerebroPreflight.proxyAvailable ? "proxy fallback available" : ""}\n`,
+      );
+    } else if (cerebroPreflight.degradedReason) {
+      await onLog(
+        "stderr",
+        `[paperclip] Cerebro memory unavailable: ${cerebroPreflight.degradedReason}. Continuing with degraded memory capture.\n`,
+      );
+    }
+
+    await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv);
     const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
-    let loggedEnv = buildInvocationEnvForLogs(preparedRuntimeConfig.env, {
+    const loggedEnv = buildInvocationEnvForLogs(preparedRuntimeConfig.env, {
       runtimeEnv,
       includeRuntimeKeys: ["HOME"],
       resolvedCommand,
     });
-    if (!executionTargetIsRemote) {
+
+    if (!executionTargetIsRemote && !serverUrl) {
       await ensureOpenCodeModelConfiguredAndAvailable({
         model,
         command,
@@ -352,32 +389,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
 
+    const timeoutSec = asNumber(config.timeoutSec, 0);
+    const graceSec = asNumber(config.graceSec, 20);
     const extraArgs = (() => {
       const fromExtraArgs = asStringArray(config.extraArgs);
       if (fromExtraArgs.length > 0) return fromExtraArgs;
       return asStringArray(config.args);
     })();
+    const effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
     let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
     let localSkillsDir: string | null = null;
-    let remoteRuntimeRootDir: string | null = null;
-    let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
 
-    if (executionTarget?.kind === "remote") {
+    if (executionTargetIsRemote) {
       localSkillsDir = await buildOpenCodeSkillsDir(config);
       await onLog(
         "stdout",
         `[paperclip] Syncing workspace and OpenCode runtime assets to ${describeAdapterExecutionTarget(executionTarget)}.\n`,
       );
       const preparedExecutionTargetRuntime = await prepareAdapterExecutionTargetRuntime({
-        runId,
         target: executionTarget,
         adapterKey: "opencode",
-        timeoutSec,
         workspaceLocalDir: cwd,
-        installCommand: SANDBOX_INSTALL_COMMAND,
-        detectCommand: command,
-        onProgress: (line) => onLog("stdout", line),
-        onRuntimeProgress: ctx.onRuntimeProgress,
         assets: [
           {
             key: "skills",
@@ -392,23 +424,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             : []),
         ],
       });
-      restoreRemoteWorkspace = () =>
-        preparedExecutionTargetRuntime.restoreWorkspace((line) => onLog("stdout", line));
-      effectiveExecutionCwd = preparedExecutionTargetRuntime.workspaceRemoteDir ?? effectiveExecutionCwd;
-      refreshPaperclipWorkspaceEnvForExecution({
-        env: preparedRuntimeConfig.env,
-        envConfig,
-        workspaceCwd: effectiveWorkspaceCwd,
-        workspaceSource,
-        workspaceId,
-        workspaceRepoUrl,
-        workspaceRepoRef,
-        workspaceHints,
-        agentHome,
-        executionTargetIsRemote,
-        executionCwd: effectiveExecutionCwd,
-      });
-      remoteRuntimeRootDir = preparedExecutionTargetRuntime.runtimeRootDir;
+      restoreRemoteWorkspace = () => preparedExecutionTargetRuntime.restoreWorkspace();
       const managedHome = adapterExecutionTargetUsesManagedHome(executionTarget);
       if (managedHome && preparedExecutionTargetRuntime.runtimeRootDir) {
         preparedRuntimeConfig.env.HOME = preparedExecutionTargetRuntime.runtimeRootDir;
@@ -434,40 +450,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           { cwd, env: preparedRuntimeConfig.env, timeoutSec, graceSec, onLog },
         );
       }
-      await ensureRemoteOpenCodeModelConfiguredAndAvailable({
-        runId,
-        executionTarget,
-        command,
-        model,
-        cwd,
-        env: preparedRuntimeConfig.env,
-        timeoutSec,
-        graceSec,
-      });
-    }
-    const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
-    if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(runtimeExecutionTarget)) {
-      paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
-        runId,
-        target: runtimeExecutionTarget,
-        runtimeRootDir: remoteRuntimeRootDir,
-        adapterKey: "opencode",
-        timeoutSec,
-        hostApiToken: preparedRuntimeConfig.env.PAPERCLIP_API_KEY,
-        onLog,
-      });
-      if (paperclipBridge) {
-        Object.assign(preparedRuntimeConfig.env, paperclipBridge.env);
-        loggedEnv = buildInvocationEnvForLogs(preparedRuntimeConfig.env, {
-          runtimeEnv: Object.fromEntries(
-            Object.entries(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env })).filter(
-              (entry): entry is [string, string] => typeof entry[1] === "string",
-            ),
-          ),
-          includeRuntimeKeys: ["HOME"],
-          resolvedCommand,
-        });
-      }
     }
 
     const runtimeSessionParams = parseObject(runtime.sessionParams);
@@ -477,7 +459,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const canResumeSession =
       runtimeSessionId.length > 0 &&
       (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
-      adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
+      adapterExecutionTargetSessionMatches(runtimeRemoteExecution, executionTarget);
     const sessionId = canResumeSession ? runtimeSessionId : null;
     if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
       await onLog(
@@ -514,6 +496,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const commandNotes = (() => {
       const notes = [...preparedRuntimeConfig.notes];
+      if (serverUrl) {
+        notes.push(`Using external OpenCode server at ${serverUrl}`);
+      }
       if (!resolvedInstructionsFilePath) return notes;
       if (instructionsPrefix.length > 0) {
         notes.push(`Loaded agent instructions from ${resolvedInstructionsFilePath}`);
@@ -544,14 +529,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : "";
     const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(sessionId) });
     const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
-    const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
-      ? ""
-      : renderTemplate(promptTemplate, templateData);
+    const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
     const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+    const attachRuntimeNote = buildOpenCodeAttachRuntimeNote({
+      serverUrl,
+      paperclipApiUrl: env.PAPERCLIP_API_URL,
+      runId,
+    });
     const prompt = joinPromptSections([
       instructionsPrefix,
       renderedBootstrapPrompt,
       wakePrompt,
+      attachRuntimeNote,
       sessionHandoffNote,
       renderedPrompt,
     ]);
@@ -564,17 +553,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       heartbeatPromptChars: renderedPrompt.length,
     };
 
-    // Optional diagnostic: surface OpenCode's own logs on stderr (captured into the
-    // run result) so failures that OpenCode otherwise wraps as an opaque
-    // "Unexpected server error" can be diagnosed in remote/sandbox runs where the
-    // log file is unreachable. Toggle via PAPERCLIP_OPENCODE_PRINT_LOGS (run env,
-    // then process env).
-    const printLogs = isTruthyEnvFlag(
-      env.PAPERCLIP_OPENCODE_PRINT_LOGS ?? process.env.PAPERCLIP_OPENCODE_PRINT_LOGS,
-    );
     const buildArgs = (resumeSessionId: string | null) => {
       const args = ["run", "--format", "json"];
-      if (printLogs) args.push("--print-logs");
+      if (serverUrl) args.push("--attach", serverUrl);
       if (resumeSessionId) args.push("--session", resumeSessionId);
       if (model) args.push("--model", model);
       if (variant) args.push("--variant", variant);
@@ -598,16 +579,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         });
       }
 
-      const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
+      const proc = await runAdapterExecutionTargetProcess(runId, executionTarget, command, args, {
         cwd,
         env: preparedRuntimeConfig.env,
         stdin: prompt,
         timeoutSec,
         graceSec,
         onSpawn,
-        onRuntimeProgress: ctx.onRuntimeProgress,
         onLog,
-        runLogTail: paperclipBridge?.runLogTail,
       });
       return {
         proc,
@@ -646,7 +625,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
             ...(executionTargetIsRemote
               ? {
-                  remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
+                  remoteExecution: adapterExecutionTargetSessionIdentity(executionTarget),
                 }
               : {}),
           } as Record<string, unknown>)
@@ -661,12 +640,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         stderrLine ||
         `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
       const modelId = model || null;
+      const transientRetryNotBefore =
+        (synthesizedExitCode ?? 0) !== 0
+          ? extractOpenCodeRetryNotBefore({
+              stdout: attempt.proc.stdout,
+              stderr: attempt.proc.stderr,
+              errorMessage: fallbackErrorMessage,
+            })
+          : null;
+      const transientUpstream =
+        (synthesizedExitCode ?? 0) !== 0 &&
+        isOpenCodeTransientUpstreamError({
+          stdout: attempt.proc.stdout,
+          stderr: attempt.proc.stderr,
+          errorMessage: fallbackErrorMessage,
+        });
 
       return {
         exitCode: synthesizedExitCode,
         signal: attempt.proc.signal,
         timedOut: false,
         errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
+        errorCode: transientUpstream ? "opencode_transient_upstream" : null,
+        errorFamily: transientUpstream ? "transient_upstream" : null,
+        retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
         usage: {
           inputTokens: attempt.parsed.usage.inputTokens,
           outputTokens: attempt.parsed.usage.outputTokens,
@@ -683,6 +680,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         resultJson: {
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
+          ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
+          ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+          ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
         },
         summary: attempt.parsed.summary,
         clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
@@ -709,9 +709,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return toResult(initial);
     } finally {
       await Promise.all([
-        paperclipBridge?.stop(),
         restoreRemoteWorkspace?.(),
         localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
+        attachEnvDir ? fs.rm(attachEnvDir, { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
       ]);
     }
   } finally {
