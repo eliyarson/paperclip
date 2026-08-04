@@ -1,0 +1,111 @@
+# Builds the Hermes agent wrapper image (docker/hermes-agent/Dockerfile) and
+# pushes it to the k3s in-cluster registry (10.43.150.22:5000).
+#
+# The wrapper image bakes in the Playwright browser set (revision 1223) that
+# agent workspaces need, making the browser cache durable across pod deletion
+# and image rebuilds (HER-134). The StatefulSet in namespace `ai` references
+# this image (docker/hermes-agent/statefulset.yaml).
+#
+# The GitHub runner cannot reach the in-cluster registry IP, so the image is
+# transferred with `docker save | ssh docker load` and pushed from the VPS —
+# the same pattern as pricehunter/.github/workflows/preview-deploy.yml.
+# Required repo secret: VPS_SSH_KEY (same key as the eliyarson/pricehunter
+# repo). Ask the coordinator to add it to this repo before the first run.
+name: hermes-agent-wrapper
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Tag for the wrapper image (default: latest)'
+        required: false
+        default: latest
+
+env:
+  REGISTRY: 10.43.150.22:5000
+  IMAGE_NAME: hermes-agent
+  VPS_HOST: 2.24.100.112
+  VPS_USER: root
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/vps_key
+          chmod 600 ~/.ssh/vps_key
+          ssh-keyscan -H ${{ env.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Build wrapper image
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.image_tag }}"
+          docker build -t "${REGISTRY}/${IMAGE_NAME}:${TAG}" docker/hermes-agent
+
+      # The in-cluster registry (registry:2, pricehunter infra/k8s/12-registry.yaml)
+      # serves plain HTTP on 10.43.150.22:5000 (no TLS). The VPS docker daemon
+      # refuses to push to an unknown HTTP registry, so bootstrap the
+      # insecure-registries entry idempotently (mirrors pricehunter
+      # preview-deploy.yml, which hit "http: server gave HTTP response to
+      # HTTPS client" — HER-55).
+      - name: Ensure VPS docker trusts in-cluster registry (insecure)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ env.VPS_HOST }}
+          username: ${{ env.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          command_timeout: 3m
+          script: |
+            set -euo pipefail
+            REGISTRY="${{ env.REGISTRY }}"
+            # Already configured → nothing to do (idempotent re-runs).
+            if docker info --format '{{.RegistryConfig.IndexConfigs}}' 2>/dev/null | grep -q "${REGISTRY}"; then
+              echo "OK: ${REGISTRY} already configured as insecure registry"
+              exit 0
+            fi
+            # Merge (never clobber) any existing daemon.json keys via python3,
+            # which is present on the VPS (used by k3s install).
+            mkdir -p /etc/docker
+            python3 - "$REGISTRY" <<'PY' > /etc/docker/daemon.json.new
+            import json, os, sys
+            reg = sys.argv[1]
+            cfg = {}
+            if os.path.exists("/etc/docker/daemon.json"):
+                try:
+                    with open("/etc/docker/daemon.json") as f:
+                        cfg = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    cfg = {}
+            ins = cfg.get("insecure-registries", [])
+            if reg not in ins:
+                ins.append(reg)
+            cfg["insecure-registries"] = ins
+            print(json.dumps(cfg, indent=2))
+            PY
+            mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+            systemctl restart docker
+            # Wait for the daemon to come back, then verify the config is live.
+            for _ in $(seq 1 30); do
+              docker info >/dev/null 2>&1 && break
+              sleep 1
+            done
+            docker info --format '{{.RegistryConfig.IndexConfigs}}' | grep -q "${REGISTRY}" \
+              || { echo "ERROR: insecure registry config not active after restart"; exit 1; }
+            echo "OK: docker daemon now trusts ${REGISTRY} (insecure)"
+
+      # The runner cannot reach the in-cluster registry IP — transfer via
+      # `docker save | ssh docker load`, then push from the VPS.
+      - name: Push image to in-cluster registry via VPS
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.image_tag }}"
+          SSH_OPTS="-i ${HOME}/.ssh/vps_key -o StrictHostKeyChecking=accept-new"
+          docker save "${REGISTRY}/${IMAGE_NAME}:${TAG}" \
+            | ssh ${SSH_OPTS} ${VPS_USER}@${VPS_HOST} 'docker load'
+          ssh ${SSH_OPTS} ${VPS_USER}@${VPS_HOST} \
+            "docker push ${REGISTRY}/${IMAGE_NAME}:${TAG}"
