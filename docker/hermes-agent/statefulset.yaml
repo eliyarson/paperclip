@@ -1,24 +1,24 @@
-# Hermes agent StatefulSet (namespace: ai) — tracked manifest (HER-134).
+# Hermes agent StatefulSet (namespace: ai) — tracked manifest (HER-134,
+# reconciled with the live object 2026-08-05, HER-206).
 #
 # This file is the durable source of truth for the hermes-agent StatefulSet.
-# Previously the object existed only as a kubectl last-applied annotation.
-# It now references the wrapper image (docker/hermes-agent/Dockerfile), which
+# It references the wrapper image (docker/hermes-agent/Dockerfile), which
 # bakes in the Playwright 1223 browser set so the browser cache survives pod
-# deletion and image rebuilds.
+# deletion and image rebuilds (HER-134 durability guarantee). The wrapper
+# image is built and loaded into the local k3s containerd via
+# docker/hermes-agent/build-and-import.sh — this cluster has no in-cluster
+# registry (HER-206 decision, option (a); see docker/hermes-agent/README.md).
 #
-# !!! READ BEFORE APPLYING !!!
-# kubectl apply performs a three-way merge: fields present in the live object
-# but ABSENT from this file are PRUNED. Before the first apply, reconcile this
-# file against the live object and port over anything missing (env vars,
-# probes, resources, tolerations, node selectors, etc.):
-#
-#   kubectl -n ai get sts hermes-agent -o yaml > /tmp/hermes-agent-live.yaml
-#   diff -u /tmp/hermes-agent-live.yaml docker/hermes-agent/statefulset.yaml
+# Reconciliation (HER-206, 2026-08-05): this file matches the live object —
+# container command (hermes gateway run), envFrom configMapRef hermes-env,
+# env (PYTHONPATH only), configMap volume hermes-config-vol →
+# hermes-config-volume, PVC 10Gi, image hermes-agent-wrapper:1.60-browsers
+# with imagePullPolicy IfNotPresent.
 #
 # SECURITY: the readiness probe in the live object carries a Bearer token
-# (HER-134 constraint: never commit or paste it). The probe below uses
-# BEARER_TOKEN_PLACEHOLDER, which must be replaced at apply time from the live
-# object. If the token ever leaks, rotate it.
+# (HER-134/HER-206 constraint: never commit or paste it). The probe below
+# uses BEARER_TOKEN_PLACEHOLDER, which must be replaced at apply time from
+# the live object. If the token ever leaks, rotate it.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -41,35 +41,33 @@ spec:
         - name: hermes-agent
           # Wrapper image: upstream hermes-agent + Playwright 1223 browser set
           # baked into image layers (docker/hermes-agent/Dockerfile). Built and
-          # pushed by .github/workflows/hermes-agent-wrapper.yml.
-          image: 10.43.150.22:5000/hermes-agent:latest
-          # :latest tag → pull on every (re)start so a re-pushed wrapper image
-          # is picked up; pulls are LAN-speed from the in-cluster registry.
-          imagePullPolicy: Always
+          # imported into local k3s containerd via
+          # docker/hermes-agent/build-and-import.sh (no in-cluster registry on
+          # this cluster). Tag convention: <playwright-core major.minor>-browsers.
+          image: hermes-agent-wrapper:1.60-browsers
+          # IfNotPresent: the image is loaded locally into k3s containerd, never
+          # pulled from a registry; re-importing the same tag does not re-pull,
+          # so roll out a new tag deliberately (see README).
+          imagePullPolicy: IfNotPresent
+          command:
+            - /opt/hermes/bin/hermes
+            - gateway
+            - run
           ports:
             - name: api
               containerPort: 8642
+          # API key + agent config are injected from the hermes-env ConfigMap
+          # (live convention — do not inline secrets here).
+          envFrom:
+            - configMapRef:
+                name: hermes-env
           env:
-            - name: API_SERVER_ENABLED
-              value: "true"
-            - name: API_SERVER_HOST
-              value: "0.0.0.0"
-            - name: API_SERVER_PORT
-              value: "8642"
-            - name: HERMES_HOME
-              value: /opt/data
-            - name: HERMES_WRITE_SAFE_ROOT
-              value: /opt/data
-            - name: HERMES_DISABLE_LAZY_INSTALLS
-              value: "1"
-            - name: HERMES_LAZY_INSTALL_TARGET
-              value: /opt/data/lazy-packages
-            - name: PLAYWRIGHT_BROWSERS_PATH
-              value: /opt/hermes/.playwright
+            - name: PYTHONPATH
+              value: /opt/data/pylibs
           volumeMounts:
             - name: hermes-data
               mountPath: /opt/data
-            - name: hermes-config
+            - name: hermes-config-vol
               mountPath: /opt/data/config.yaml
               subPath: config.yaml
               readOnly: true
@@ -85,9 +83,9 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 10
       volumes:
-        - name: hermes-config
+        - name: hermes-config-vol
           configMap:
-            name: hermes-config
+            name: hermes-config-volume
   # /opt/data (HERMES_HOME, agent workspaces) persists on this PVC across pod
   # deletion/recreation. Reconcile the storage request with the live object.
   volumeClaimTemplates:
@@ -98,4 +96,4 @@ spec:
         storageClassName: local-path
         resources:
           requests:
-            storage: 50Gi
+            storage: 10Gi

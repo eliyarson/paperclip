@@ -1,4 +1,4 @@
-# hermes-agent wrapper image + StatefulSet (HER-134)
+# hermes-agent wrapper image + StatefulSet (HER-134, HER-206)
 
 Makes the Playwright browser cache durable for Hermes agents.
 
@@ -37,37 +37,74 @@ documented fallback (single env override + one-time install).
 ## Layout
 
 - `Dockerfile` — wrapper image: upstream image + `playwright-core@1.60.0 install chromium`
-- `statefulset.yaml` — tracked StatefulSet manifest (namespace `ai`), references the wrapper image
-- `.github/workflows/hermes-agent-wrapper.yml` — build + push workflow (repo root)
+- `statefulset.yaml` — tracked StatefulSet manifest (namespace `ai`), references the wrapper image; reconciled with the live object 2026-08-05 (HER-206)
+- `build-and-import.sh` — build + import the wrapper image into the local k3s containerd (the local-cluster distribution path)
 
-## Build & push
+## Image distribution for the local cluster (HER-206 decision)
 
-Via CI (recommended): run the `hermes-agent-wrapper` workflow
-(`workflow_dispatch`) in GitHub Actions. Requires the `VPS_SSH_KEY` repo
-secret (same key as the `eliyarson/pricehunter` repo — ask the coordinator to
-add it to this repo before the first run). The workflow builds on the runner,
-transfers the image with `docker save | ssh docker load`, and pushes from the
-VPS to the in-cluster registry (`10.43.150.22:5000`).
+Decision: **option (a) — build on the k3s host and import into k3s containerd**
+(`docker save | sudo k3s ctr images import`). This is the path the HER-137
+rollout actually used and verified; it needs no new infrastructure and no
+credentials.
 
-Manually on the VPS (2.24.100.112, where `docker` + `kubectl` have cluster
-access):
+Rejected alternatives:
+
+- **(b) in-cluster registry on the local k3s** — new infrastructure (registry:2
+  Deployment + Service + pull config) to serve a single image to a single
+  node; nothing else on this cluster needs a registry.
+- **(c) GHCR / docker hub** — the wrapper image is ~1 GB+ (browsers baked in);
+  CI would need push credentials and the local node pull credentials, and the
+  GitHub runner cannot reach the cluster anyway.
+
+The previous GitHub Actions workflow (`.github/workflows/hermes-agent-wrapper.yml`)
+pushed to `10.43.150.22:5000` — the **VPS production cluster** registry
+(pricehunter `infra/k8s/12-registry.yaml`), which does not exist on the local
+dev k3s (`cachyos-x8664`). It never ran (missing `VPS_SSH_KEY` secret) and even
+if it had, the local cluster cannot pull from that IP. It was removed in
+HER-206; the script below is the distribution path.
+
+### Rebuild + redistribute (run ON the k3s host)
 
 ```sh
-cd <paperclip checkout>
-docker build -t 10.43.150.22:5000/hermes-agent:latest docker/hermes-agent
-docker push 10.43.150.22:5000/hermes-agent:latest
+./docker/hermes-agent/build-and-import.sh                 # hermes-agent-wrapper:1.60-browsers
+./docker/hermes-agent/build-and-import.sh 1.61-browsers   # after a browser-set bump
 ```
 
-## Apply (manual, on the VPS)
+The script builds the Dockerfile, imports the image into k3s containerd
+(`docker save | sudo k3s ctr images import -`), verifies the import, and warns
+if the StatefulSet still references a different tag. Idempotent: re-importing
+the same tag only replaces the image in the containerd store — running pods
+are unaffected until you roll out.
 
-> Reconciliation required before first apply. `kubectl apply` prunes live
-> fields absent from the file (three-way merge). Diff first and port over
-> anything missing (env, probes, resources, tolerations, ...):
->
-> ```sh
-> kubectl -n ai get sts hermes-agent -o yaml > /tmp/hermes-agent-live.yaml
-> diff -u /tmp/hermes-agent-live.yaml docker/hermes-agent/statefulset.yaml
-> ```
+Manual equivalent:
+
+```sh
+docker build -t hermes-agent-wrapper:1.60-browsers docker/hermes-agent
+docker save hermes-agent-wrapper:1.60-browsers | sudo k3s ctr images import -
+sudo k3s ctr images ls | grep hermes-agent-wrapper
+```
+
+### Roll out a new tag
+
+`statefulset.yaml` references `hermes-agent-wrapper:1.60-browsers` with
+`imagePullPolicy: IfNotPresent` (live-object convention, HER-206 scope item 3).
+IfNotPresent means re-importing the same tag never re-pulls — so:
+
+1. import the new tag (script above),
+2. point the StatefulSet at it and roll out:
+
+```sh
+kubectl -n ai set image sts/hermes-agent hermes-agent=hermes-agent-wrapper:<TAG>
+kubectl -n ai rollout status sts/hermes-agent
+```
+
+## Apply (manual, on the k3s host)
+
+> The tracked manifest was reconciled with the live object on 2026-08-05
+> (HER-206): container command (`/opt/hermes/bin/hermes gateway run`), envFrom
+> `configMapRef hermes-env`, env (PYTHONPATH only), configMap volume
+> `hermes-config-vol` → `hermes-config-volume`, PVC 10Gi, image
+> `hermes-agent-wrapper:1.60-browsers` with IfNotPresent.
 >
 > SECURITY: the readiness probe carries a Bearer token. It lives only in the
 > cluster (secret / last-applied annotation). Never commit or paste it; the
@@ -75,6 +112,11 @@ docker push 10.43.150.22:5000/hermes-agent:latest
 > apply time. If it ever leaks, rotate it.
 
 ```sh
+# Server-side dry-run against the live object first (shows exactly what would
+# change; the probe-token diff is expected and fine):
+kubectl -n ai apply --dry-run=server -f docker/hermes-agent/statefulset.yaml
+
+# Real apply — replace BEARER_TOKEN_PLACEHOLDER with the live token first:
 kubectl apply -f docker/hermes-agent/statefulset.yaml
 kubectl -n ai rollout status sts/hermes-agent
 ```
