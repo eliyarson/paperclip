@@ -6,6 +6,8 @@ import {
   applyPersistedExecutionWorkspaceConfig,
   buildRealizedExecutionWorkspaceFromPersisted,
   buildExplicitResumeSessionOverride,
+  deriveSessionTaskKey,
+  deriveTaskKey,
   deriveTaskKeyWithHeartbeatFallback,
   extractWakeCommentIds,
   formatRuntimeWorkspaceWarningLog,
@@ -356,6 +358,23 @@ describe("shouldResetTaskSessionForWake", () => {
       }),
     ).toBe(false);
   });
+
+  // HER-707: routine fires continue their session instead of resetting.
+  it("does not reset session for routine wakes (routineId present)", () => {
+    expect(
+      shouldResetTaskSessionForWake({ wakeReason: "issue_assigned", routineId: "routine-1" }),
+    ).toBe(false);
+  });
+
+  it("still resets when forceFreshSession is requested even for routine wakes", () => {
+    expect(
+      shouldResetTaskSessionForWake({
+        wakeReason: "issue_assigned",
+        routineId: "routine-1",
+        forceFreshSession: true,
+      }),
+    ).toBe(true);
+  });
 });
 
 describe("deriveTaskKeyWithHeartbeatFallback", () => {
@@ -383,6 +402,79 @@ describe("deriveTaskKeyWithHeartbeatFallback", () => {
 
   it("returns null for empty context", () => {
     expect(deriveTaskKeyWithHeartbeatFallback({}, null)).toBeNull();
+  });
+});
+
+describe("deriveSessionTaskKey", () => {
+  it("keys routine wakes by routine:<routineId> ahead of the per-fire execution issue id", () => {
+    // enrichWakeContextSnapshot stamps the fresh execution issue id into
+    // taskKey/taskId/issueId; the routine id must still win so consecutive
+    // routine fires share one agent_task_sessions row (HER-707).
+    expect(
+      deriveSessionTaskKey(
+        {
+          routineId: "routine-1",
+          taskKey: "execution-issue-1",
+          taskId: "execution-issue-1",
+          issueId: "execution-issue-1",
+          wakeSource: "automation",
+        },
+        null,
+      ),
+    ).toBe("routine:routine-1");
+  });
+
+  it("keeps the routine key stable across different execution issues of the same routine", () => {
+    const first = deriveSessionTaskKey({ routineId: "routine-1", issueId: "issue-a" }, null);
+    const second = deriveSessionTaskKey({ routineId: "routine-1", issueId: "issue-b" }, null);
+    expect(first).toBe("routine:routine-1");
+    expect(second).toBe("routine:routine-1");
+  });
+
+  it("rejects key-shape spoofing from routine ids containing ':'", () => {
+    expect(deriveSessionTaskKey({ routineId: "routine:evil", issueId: "issue-1" }, null)).toBe("issue-1");
+  });
+
+  it("falls back to the issue key when no routineId is present", () => {
+    expect(deriveSessionTaskKey({ issueId: "issue-1" }, null)).toBe("issue-1");
+  });
+
+  it("falls back to __heartbeat__ for timer wakes without routine or issue context", () => {
+    expect(deriveSessionTaskKey({ wakeSource: "timer" }, null)).toBe("__heartbeat__");
+  });
+
+  // HER-707: different routines assigned to the same agent must get distinct
+  // session keys (unique index on company/agent/adapter/task_key).
+  it("produces distinct session keys for different routine ids", () => {
+    expect(deriveSessionTaskKey({ routineId: "r1" }, null)).toBe("routine:r1");
+    expect(deriveSessionTaskKey({ routineId: "r2" }, null)).toBe("routine:r2");
+    expect(deriveSessionTaskKey({ routineId: "r1" }, null)).not.toBe(
+      deriveSessionTaskKey({ routineId: "r2" }, null),
+    );
+  });
+
+  it("keys routine id without wakeSource (manual routine runs)", () => {
+    expect(deriveSessionTaskKey({ routineId: "routine-1" }, null)).toBe("routine:routine-1");
+  });
+});
+
+describe("deriveTaskKey (coalescing invariant, HER-707)", () => {
+  // The run coalescing key must stay issue-keyed even when routineId is
+  // present. If coalescing switched to `routine:<id>`, a second fire while
+  // the first run is queued/running would coalesce into the first run and
+  // the second execution issue would never get its own run (HER-707
+  // success criterion 4). This pins the decoupling between session key
+  // (deriveSessionTaskKey) and coalescing key (deriveTaskKey).
+  it("returns the per-fire issue id even when routineId is present", () => {
+    expect(deriveTaskKey({ issueId: "fire-1", routineId: "r1" }, null)).toBe("fire-1");
+  });
+
+  it("still prefers explicit taskKey over issueId", () => {
+    expect(deriveTaskKey({ taskKey: "explicit-key", issueId: "fire-1" }, null)).toBe("explicit-key");
+  });
+
+  it("returns null for empty context", () => {
+    expect(deriveTaskKey({}, null)).toBeNull();
   });
 });
 
