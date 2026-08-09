@@ -997,6 +997,12 @@ export function routineService(
           reason: "issue_assigned",
           mutation: "create",
           contextSource: "routine.dispatch",
+          // Stable routine id: the heartbeat session touchpoints derive the
+          // `routine:<routineId>` session key from it so consecutive fires share
+          // one agent_task_sessions row and resume (HER-707). Run coalescing
+          // stays per-execution-issue (plain taskKey) — only session identity
+          // uses the routine key.
+          routineId: input.routine.id,
           requestedByActorType: input.source === "schedule" ? "system" : undefined,
           rethrowOnError: true,
         });
