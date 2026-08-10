@@ -15,32 +15,48 @@ const mockCalls = {
 };
 
 // Mock the forge-sync service module
-vi.mock("../services/forge-sync.js", () => ({
+vi.mock("../services/forge-sync.js", async () => {
+  const { HttpError } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+
+  class ForgeSyncError extends Error {
+    code: string;
+    changeId: string | null;
+    status: number;
+    constructor(message: string, code: string, changeId: string | null, status: number = 409) {
+      super(message);
+      this.code = code;
+      this.changeId = changeId;
+      this.status = status;
+    }
+  }
+
+  return {
   linkIssueToForge: vi.fn(async (db: any, input: any) => {
     mockCalls.linkIssueToForge.push({ db, input });
 
     // Simulate conflict if change already linked
     if (input.changeId === "conflict-change") {
-      const error = new Error(`Change ${input.changeId} is already linked to issue PAP-777`) as any;
-      error.status = 409;
-      error.code = "FORGE_LINK_CONFLICT";
-      error.changeId = input.changeId;
-      throw error;
+      throw new ForgeSyncError(
+        `Change ${input.changeId} is already linked to issue PAP-777`,
+        "FORGE_LINK_CONFLICT",
+        input.changeId,
+        409,
+      );
     }
 
     // Simulate not found
     if (input.issueId === "non-existent") {
-      const error = new Error("Issue not found") as any;
-      error.status = 404;
-      throw error;
+      throw new ForgeSyncError("Issue not found", "FORGE_ISSUE_NOT_FOUND", input.changeId, 404);
     }
 
     // Simulate cancelled issue
     if (input.issueId === "cancelled-issue") {
-      const error = new Error("Cannot link cancelled issue to Forge Charter") as any;
-      error.status = 409;
-      error.code = "FORGE_LINK_CANCELLED_ISSUE";
-      throw error;
+      throw new ForgeSyncError(
+        "Cannot link cancelled issue to Forge Charter",
+        "FORGE_LINK_CANCELLED_ISSUE",
+        input.changeId,
+        409,
+      );
     }
 
     return {
@@ -56,9 +72,7 @@ vi.mock("../services/forge-sync.js", () => ({
 
     // Simulate not found
     if (issueId === "non-existent") {
-      const error = new Error("Issue not found") as any;
-      error.status = 404;
-      throw error;
+      throw new HttpError(404, "Issue not found");
     }
 
     // Simulate unlinked issue
@@ -133,18 +147,9 @@ vi.mock("../services/forge-sync.js", () => ({
     };
   }),
 
-  ForgeSyncError: class ForgeSyncError extends Error {
-    code: string;
-    changeId: string | null;
-    status: number;
-    constructor(message: string, code: string, changeId: string | null, status: number = 409) {
-      super(message);
-      this.code = code;
-      this.changeId = changeId;
-      this.status = status;
-    }
-  },
-}));
+  ForgeSyncError,
+  };
+});
 
 // Mock other required modules
 vi.mock("../services/index.js", async (importOriginal) => {
@@ -160,8 +165,11 @@ vi.mock("../services/index.js", async (importOriginal) => {
   };
 });
 
-// Mock minimal required dependencies
-vi.mock("@paperclipai/db", () => ({
+// Mock minimal required dependencies. Spread the real module surface so named
+// imports used by the services graph (e.g. companyLogos, feedbackVotes) resolve,
+// while the tables the route handlers exercise stay mocked as plain objects.
+vi.mock("@paperclipai/db", async () => ({
+  ...(await vi.importActual<typeof import("@paperclipai/db")>("@paperclipai/db")),
   issues: {},
   labels: {},
   activityLog: {},
@@ -202,11 +210,12 @@ vi.mock("drizzle-orm", () => ({
   lt: vi.fn(),
   asc: vi.fn(),
   desc: vi.fn(),
-  sql: vi.fn(),
+  sql: vi.fn(() => ({ as: vi.fn(() => ({})), mapWith: vi.fn(() => ({})) })),
   getTableColumns: vi.fn(() => ({})),
 }));
 
-vi.mock("@paperclipai/shared", () => ({
+vi.mock("@paperclipai/shared", async () => ({
+  ...(await vi.importActual<typeof import("@paperclipai/shared")>("@paperclipai/shared")),
   extractAgentMentionIds: vi.fn(() => []),
   extractProjectMentionIds: vi.fn(() => []),
   isUuidLike: vi.fn(() => true),
@@ -243,6 +252,37 @@ vi.mock("@paperclipai/shared", () => ({
   IssueRelationIssueSummary: {},
 }));
 
+// Universal chainable + thenable DB mock: any drizzle chain shape
+// (select/insert/update/delete → from/where/limit/orderBy/join/… → then/catch/
+// execute) resolves to `result` when awaited, so route handlers see rows
+// instead of throwing on unsupported chain steps. Select chains resolve to a
+// single issue row so svc.getById() finds an issue for the route handlers.
+function createChainableDb() {
+  const issueFixture = [{ id: "my-issue-id", companyId: "company-1" }];
+  const chain = (result: unknown) => {
+    const step: any = () => chain(result);
+    return new Proxy(step, {
+      get(_target, prop) {
+        if (prop === "then") return (resolve: (v: unknown) => void) => resolve(result);
+        if (prop === "catch") return () => Promise.resolve(result);
+        if (prop === "finally") return (cb: () => void) => Promise.resolve(result).finally(cb);
+        if (prop === "execute") return async () => result;
+        if (prop === Symbol.toStringTag) return "Promise";
+        return () => chain(result);
+      },
+    });
+  };
+  const db: any = {
+    select: () => chain(issueFixture),
+    insert: () => chain([]),
+    update: () => chain([]),
+    delete: () => chain([]),
+    transaction: async (fn: any) => fn(db),
+    query: new Proxy({}, { get: () => chain([]) }),
+  };
+  return db;
+}
+
 // Create Express app with routes
 async function createTestApp() {
   const [{ errorHandler }, { issueRoutes }] = await Promise.all([
@@ -264,12 +304,7 @@ async function createTestApp() {
   });
 
   // Mock DB
-  const mockDb = {
-    select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => ({ limit: vi.fn(async () => []) })) })) })),
-    insert: vi.fn(() => ({ values: vi.fn(() => ({ returning: vi.fn(async () => []) })) })),
-    update: vi.fn(() => ({ set: vi.fn(() => ({ where: vi.fn(async () => []) })) })),
-    transaction: vi.fn(async (fn: any) => fn(mockDb)),
-  };
+  const mockDb = createChainableDb();
 
   app.use("/api", issueRoutes(mockDb as any, {} as any));
   app.use(errorHandler);
