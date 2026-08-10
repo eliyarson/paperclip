@@ -3093,6 +3093,7 @@ export function IssueChatThread({
   const location = useLocation();
   const lastScrolledHashRef = useRef<string | null>(null);
   const virtualizedThreadRef = useRef<VirtualizedIssueChatThreadListHandle | null>(null);
+  const latestSettleTimeoutsRef = useRef<number[]>([]);
   const bottomAnchorRef = useRef<HTMLDivElement | null>(null);
   const composerViewportAnchorRef = useRef<HTMLDivElement | null>(null);
   const composerViewportSnapshotRef = useRef<ReturnType<typeof captureComposerViewportSnapshot>>(null);
@@ -3385,7 +3386,7 @@ export function IssueChatThread({
 
     const settleDelays = [380, 760, 1140];
     settleDelays.forEach((delay) => {
-      window.setTimeout(() => {
+      const timeoutId = window.setTimeout(() => {
         const el = document.getElementById(latestCommentAnchor);
         if (el) {
           el.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -3399,8 +3400,20 @@ export function IssueChatThread({
           behavior: "auto",
         });
       }, delay);
+      latestSettleTimeoutsRef.current.push(timeoutId);
     });
   }
+
+  // The settle passes above are fire-and-forget scroll nudges; clear them on
+  // unmount so a late callback can't touch the DOM after the environment (or
+  // the real page) has torn the thread down.
+  useEffect(() => {
+    const timeouts = latestSettleTimeoutsRef.current;
+    return () => {
+      timeouts.forEach((id) => window.clearTimeout(id));
+      timeouts.length = 0;
+    };
+  }, []);
 
   function handleJumpToLatest() {
     if (onRefreshLatestComments) {

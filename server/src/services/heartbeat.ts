@@ -1281,7 +1281,20 @@ function parseIssueAssigneeAdapterOverrides(
  */
 const HEARTBEAT_TASK_KEY = "__heartbeat__";
 
-function deriveTaskKey(
+/**
+ * Stable session-key prefix for routine-execution wakes. Routine fires create a
+ * fresh execution issue on every dispatch, so the plain issue-keyed derivation
+ * would churn `agentTaskSessions` rows and never resume a prior session. Keying
+ * the session by `routine:<routineId>` gives consecutive fires a stable row
+ * (unique index on company/agent/adapter/task_key) and enables adapter resume.
+ *
+ * Only SESSION touchpoints use this key. Run coalescing/audit stays issue-keyed
+ * via plain `deriveTaskKey` so each fire still gets its own run + execution
+ * issue (HER-707 success criterion 4).
+ */
+const ROUTINE_TASK_KEY_PREFIX = "routine:";
+
+export function deriveTaskKey(
   contextSnapshot: Record<string, unknown> | null | undefined,
   payload: Record<string, unknown> | null | undefined,
 ) {
@@ -1294,6 +1307,35 @@ function deriveTaskKey(
     readNonEmptyString(payload?.issueId) ??
     null
   );
+}
+
+/**
+ * Routine-aware SESSION task key used at the `agentTaskSessions` touchpoints
+ * (session-before resolution, task-session lookup, upsert, clear).
+ *
+ * Precedence:
+ * 1. A validated `contextSnapshot.routineId` (non-empty, no ":") -> `routine:<id>`.
+ *    This ranks ABOVE the explicit task/issue chain because
+ *    `enrichWakeContextSnapshot` auto-stamps the per-fire execution issue id into
+ *    `contextSnapshot.taskKey`/`taskId` for every wake; an explicit-key-first
+ *    order would make the routine branch unreachable (HER-707 rev-2 blocking
+ *    finding). The routineId is only present on wakes that genuinely carry it
+ *    (routine dispatch stamps it; all other wakes leave it absent).
+ * 2. Otherwise the existing explicit chain, then the timer fallback — i.e.
+ *    `deriveTaskKeyWithHeartbeatFallback` semantics, unchanged for every
+ *    non-routine wake (issue work, comments, timer, plugin automation).
+ *
+ * The ":" guard rejects key-shape spoofing from wake payloads (falls through).
+ */
+export function deriveSessionTaskKey(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  payload: Record<string, unknown> | null | undefined,
+) {
+  const routineId = readNonEmptyString(contextSnapshot?.routineId);
+  if (routineId && !routineId.includes(":")) {
+    return `${ROUTINE_TASK_KEY_PREFIX}${routineId}`;
+  }
+  return deriveTaskKeyWithHeartbeatFallback(contextSnapshot, payload);
 }
 
 /**
@@ -1322,6 +1364,12 @@ export function shouldResetTaskSessionForWake(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
   if (contextSnapshot?.forceFreshSession === true) return true;
+
+  // Routine fires continue rather than reset: the stable `routine:<id>` session
+  // exists precisely so consecutive fires resume it (HER-707 success criterion 2).
+  // Keep the forceFreshSession check above winning so an explicit fresh-session
+  // request still resets even for routine wakes.
+  if (readNonEmptyString(contextSnapshot?.routineId)) return false;
 
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (
@@ -1397,6 +1445,8 @@ function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
   if (contextSnapshot?.forceFreshSession === true) return "forceFreshSession was requested";
+  // Mirror shouldResetTaskSessionForWake: routine wakes continue their session.
+  if (readNonEmptyString(contextSnapshot?.routineId)) return "routine execution continues its session";
 
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (wakeReason === "issue_assigned") return "wake reason is issue_assigned";
@@ -2074,6 +2124,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         assigneeAgentId: issues.assigneeAgentId,
         assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
         executionWorkspaceSettings: issues.executionWorkspaceSettings,
+        originKind: issues.originKind,
+        originId: issues.originId,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
@@ -2106,6 +2158,51 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ),
       )
       .then((rows) => rows[0] ?? null);
+  }
+
+  /**
+   * Stamp the routine id into the context snapshot when the wake is for a
+   * routine-execution issue. Routine dispatch creates a fresh execution issue
+   * per fire, so `contextSnapshot.routineId` is not present on the wake — the
+   * routine id lives on the issue as `originKind === "routine_execution"` +
+   * `originId`. Resolving it here (and in `executeRun`) keeps every session
+   * touchpoint keyed by the stable `routine:<routineId>` (HER-707).
+   *
+   * Only the context object passed in is mutated; no DB write happens here.
+   */
+  async function stampRoutineIdFromIssueOriginIfNeeded(
+    contextSnapshot: Record<string, unknown>,
+    issueId: string | null,
+    companyId: string,
+  ) {
+    if (readNonEmptyString(contextSnapshot.routineId)) return;
+    if (!issueId) return;
+    const origin = await db
+      .select({ originKind: issues.originKind, originId: issues.originId })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (origin?.originKind === "routine_execution" && readNonEmptyString(origin.originId)) {
+      contextSnapshot.routineId = origin.originId;
+    }
+  }
+
+  /**
+   * Routine-aware SESSION task key for run context snapshots: stamps the
+   * routine id from the execution issue when the context does not carry it
+   * (e.g. retry wakes or runs enqueued before the routineId stamping landed),
+   * then derives the session key via `deriveSessionTaskKey`. All
+   * `agentTaskSessions` touchpoints (session-before resolution, lookup, upsert,
+   * clear) must use this so consecutive routine fires share one
+   * `routine:<routineId>` row (HER-707).
+   */
+  async function resolveSessionTaskKeyForRunContext(
+    contextSnapshot: Record<string, unknown>,
+    issueId: string | null,
+    companyId: string,
+  ) {
+    await stampRoutineIdFromIssueOriginIfNeeded(contextSnapshot, issueId, companyId);
+    return deriveSessionTaskKey(contextSnapshot, null);
   }
 
   async function getLatestRunForSession(
@@ -2346,7 +2443,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!resumeRun) return null;
 
     const resumeContext = parseObject(resumeRun.contextSnapshot);
-    const resumeTaskKey = deriveTaskKey(resumeContext, null) ?? taskKey;
+    const resumeTaskKey = deriveSessionTaskKey(resumeContext, null) ?? taskKey;
     const resumeTaskSession = resumeTaskKey
       ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, resumeTaskKey)
       : null;
@@ -3074,7 +3171,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     issueId: string,
   ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
-    const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
+    const contextIssueId = readNonEmptyString(contextSnapshot.issueId);
+    const taskKey = await resolveSessionTaskKeyForRunContext(contextSnapshot, contextIssueId, run.companyId);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot = {
       ...contextSnapshot,
@@ -3295,7 +3393,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
-    const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
+    const taskKey = await resolveSessionTaskKeyForRunContext(contextSnapshot, issueId, run.companyId);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot = {
       ...contextSnapshot,
@@ -3445,7 +3543,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
-    const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
+    const taskKey = await resolveSessionTaskKeyForRunContext(contextSnapshot, issueId, run.companyId);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot: Record<string, unknown> = {
       ...contextSnapshot,
@@ -4708,10 +4806,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const runtime = await ensureRuntimeState(agent);
     const context = parseObject(run.contextSnapshot);
-    const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
     let issueContext = issueId ? await getIssueExecutionContext(agent.companyId, issueId) : null;
+    // Routine-execution issues carry their routine id in originId. Stamp it into
+    // the run context when missing (e.g. wakes enqueued before the routineId
+    // stamping landed) so the SESSION key derivation stays stable across
+    // consecutive fires (HER-707). Only `routine:<routineId>` sessions are
+    // affected; plain issue work is untouched.
+    if (
+      !readNonEmptyString(context.routineId) &&
+      issueContext?.originKind === "routine_execution" &&
+      readNonEmptyString(issueContext.originId)
+    ) {
+      context.routineId = issueContext.originId;
+    }
+    const taskKey = await resolveSessionTaskKeyForRunContext(context, issueId, agent.companyId);
     const issueDependencyReadiness = issueId
       ? await issuesSvc.listDependencyReadiness(agent.companyId, [issueId]).then((rows) => rows.get(issueId) ?? null)
       : null;
@@ -5684,6 +5794,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterResult.summary ?? null,
       );
 
+      // Persist the task-session row (upsert or clear) BEFORE the run flips to a
+      // terminal status. Consecutive routine fires (HER-707) resolve their
+      // session-before from agentTaskSessions at wake time; if the status flip
+      // were visible first, a fire dispatched immediately after this run
+      // finished could observe "succeeded" while the session row was not yet
+      // committed and fail to resume the routine:<routineId> session.
+      if (taskKey) {
+        if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
+          await clearTaskSessions(agent.companyId, agent.id, {
+            taskKey,
+            adapterType: agent.adapterType,
+          });
+        } else {
+          await upsertTaskSession({
+            companyId: agent.companyId,
+            agentId: agent.id,
+            adapterType: agent.adapterType,
+            taskKey,
+            sessionParamsJson: nextSessionState.params,
+            sessionDisplayId: nextSessionState.displayId,
+            lastRunId: run.id,
+            lastError: outcome === "succeeded" ? null : (adapterResult.errorMessage ?? "run_failed"),
+          });
+        }
+      }
+
       let persistedRun = await setRunStatus(run.id, status, {
         finishedAt: new Date(),
         error: runErrorMessage,
@@ -5750,25 +5886,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await updateRuntimeState(agent, finalizedRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
         }, normalizedUsage);
-        if (taskKey) {
-          if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
-            await clearTaskSessions(agent.companyId, agent.id, {
-              taskKey,
-              adapterType: agent.adapterType,
-            });
-          } else {
-            await upsertTaskSession({
-              companyId: agent.companyId,
-              agentId: agent.id,
-              adapterType: agent.adapterType,
-              taskKey,
-              sessionParamsJson: nextSessionState.params,
-              sessionDisplayId: nextSessionState.displayId,
-              lastRunId: finalizedRun.id,
-              lastError: outcome === "succeeded" ? null : (adapterResult.errorMessage ?? "run_failed"),
-            });
-          }
-        }
       }
       await finalizeAgentStatus(agent.id, outcome);
     } catch (err) {
@@ -5939,7 +6056,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function releaseIssueExecutionAndPromote(run: typeof heartbeatRuns.$inferSelect) {
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
-    const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
+    const taskKey = await resolveSessionTaskKeyForRunContext(runContext, contextIssueId, run.companyId);
     const recoveryAgent = await getAgent(run.agentId);
     const recoveryAgentInvokable =
       recoveryAgent &&
@@ -6384,10 +6501,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueId;
     }
-    const effectiveTaskKey = readNonEmptyString(enrichedContextSnapshot.taskKey) ?? taskKey;
+    // Routine-execution wakes carry the routine id on the execution issue, not
+    // in the wake context. Stamp it before session-before resolution so the
+    // routine-aware session key (`routine:<routineId>`) finds the prior session
+    // row instead of the per-fire execution issue id (HER-707).
+    await stampRoutineIdFromIssueOriginIfNeeded(enrichedContextSnapshot, issueId, agent.companyId);
+    const sessionTaskKey = deriveSessionTaskKey(enrichedContextSnapshot, null);
     const sessionBefore =
       explicitResumeSession?.sessionDisplayId ??
-      await resolveSessionBeforeForWakeup(agent, effectiveTaskKey);
+      await resolveSessionBeforeForWakeup(agent, sessionTaskKey);
     const continuationAttempt = readContinuationAttempt(enrichedContextSnapshot.livenessContinuationAttempt);
 
     const writeSkippedRequest = async (skipReason: string) => {
